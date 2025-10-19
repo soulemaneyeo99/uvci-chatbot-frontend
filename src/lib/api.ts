@@ -1,9 +1,6 @@
-// lib/api.ts
-
 import axios from 'axios';
 import { ChatRequest, ChatResponse, Conversation, Document } from '@/types';
 
-// ✅ Nettoyer l'URL pour éviter les doubles slashes
 const API_URL = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
 
 const api = axios.create({
@@ -11,12 +8,12 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
+  timeout: 60000, // 60 secondes
 });
 
 export const chatAPI = {
   /**
-   * 🚀 NOUVELLE MÉTHODE - Envoie un message avec streaming en temps réel
-   * Utilise Server-Sent Events (SSE) pour recevoir les chunks progressivement
+   * Envoie un message avec streaming + fallback automatique
    */
   sendMessageStream: async (
     data: ChatRequest,
@@ -25,24 +22,26 @@ export const chatAPI = {
     onError: (error: string) => void
   ): Promise<void> => {
     try {
-      // Nettoyer l'URL pour éviter les doubles slashes
       const cleanUrl = `${API_URL.replace(/\/$/, '')}/api/chat/stream`;
+      
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 55000); // 55s timeout
+      
       const response = await fetch(cleanUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
+        signal: controller.signal,
       });
 
+      clearTimeout(timeoutId);
+
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throw new Error(`HTTP ${response.status}`);
       }
 
       const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('No reader available');
-      }
+      if (!reader) throw new Error('No reader');
 
       const decoder = new TextDecoder();
       let conversationId = data.conversation_id;
@@ -51,15 +50,9 @@ export const chatAPI = {
 
       while (true) {
         const { done, value } = await reader.read();
-        
-        if (done) {
-          break;
-        }
+        if (done) break;
 
-        // Décoder le chunk
         const chunk = decoder.decode(value, { stream: true });
-        
-        // Parser les Server-Sent Events (format: "data: {...}\n\n")
         const lines = chunk.split('\n');
         
         for (const line of lines) {
@@ -67,11 +60,9 @@ export const chatAPI = {
             try {
               const jsonData = JSON.parse(line.slice(6));
               
-              // Gérer les différents types de messages
               if (jsonData.type === 'conversation_id') {
                 conversationId = jsonData.conversation_id;
               } else if (jsonData.type === 'chunk') {
-                // ✨ Envoyer le chunk au frontend pour affichage progressif
                 onChunk(jsonData.content);
               } else if (jsonData.type === 'done') {
                 messageId = jsonData.message_id;
@@ -81,38 +72,49 @@ export const chatAPI = {
                 return;
               }
             } catch (e) {
-              console.error('Error parsing SSE:', e);
+              // Ignorer les lignes keep-alive
             }
           }
         }
       }
 
-      // Appeler onComplete avec les métadonnées
       if (conversationId && messageId) {
-        onComplete({
-          conversation_id: conversationId,
-          message_id: messageId,
-          timestamp: timestamp,
-        });
+        onComplete({ conversation_id: conversationId, message_id: messageId, timestamp });
       }
 
     } catch (error) {
-      console.error('Streaming error:', error);
-      onError(error instanceof Error ? error.message : 'Unknown error');
+      console.warn('Streaming échoué, fallback sur méthode classique...', error);
+      
+      // FALLBACK : Utiliser l'endpoint classique
+      try {
+        const response = await chatAPI.sendMessage(data);
+        
+        // Simuler le streaming progressif
+        const words = response.response.split(' ');
+        for (let i = 0; i < words.length; i++) {
+          onChunk(words[i] + ' ');
+          await new Promise(resolve => setTimeout(resolve, 30));
+        }
+        
+        onComplete({
+          conversation_id: response.conversation_id,
+          message_id: response.message_id,
+          timestamp: response.timestamp.toString(),
+        });
+      } catch (fallbackError) {
+        onError('Impossible de se connecter au serveur');
+      }
     }
   },
 
   /**
-   * 📦 ANCIENNE MÉTHODE - Envoie un message sans streaming (pour compatibilité)
+   * Endpoint classique sans streaming
    */
   sendMessage: async (data: ChatRequest): Promise<ChatResponse> => {
     const response = await api.post('/api/chat/', data);
     return response.data;
   },
 
-  /**
-   * 💡 Récupère les suggestions de questions
-   */
   getSuggestions: async (): Promise<string[]> => {
     const response = await api.get('/api/chat/suggestions');
     return response.data.suggestions;
@@ -141,9 +143,7 @@ export const documentsAPI = {
     formData.append('file', file);
     
     const response = await api.post('/api/documents/upload', formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
+      headers: { 'Content-Type': 'multipart/form-data' },
     });
     return response.data;
   },
